@@ -1,403 +1,498 @@
 #include "userprog/syscall.h"
-#include <stdio.h>
+#include "lib/stdio.h"
+#include "lib/kernel/stdio.h"
 #include <syscall-nr.h>
-#include "userprog/process.h"
 #include "threads/interrupt.h"
 #include "threads/thread.h"
 #include "threads/vaddr.h"
-#include "filesys/off_t.h"
-#include "kernel/list.h"
-//#include "devices/shutdown.h"
+#include "threads/synch.h"
+#include "threads/palloc.h"
+#include "threads/malloc.h"
+#include "userprog/pagedir.h"
+#include "userprog/process.h"
+#include "devices/shutdown.h"
+#include "devices/input.h"
 
-static void syscall_handler (struct intr_frame *);
-int exec_process(char *file_name);
-void exit_process(int status);
-void * is_valid_addr(const void *vaddr);
-struct process_file* search_fd(struct list* files, int fd);
-void clean_single_file(struct list* files, int fd);
-// void clean_all_files(struct list* files); // declear in syscall.h used by another c files
+#define USER_ASSERT(CONDITION) \
+    if (CONDITION)             \
+    {                          \
+    }                          \
+    else                       \
+    {                          \
+        exit(-1);              \
+    }
 
-
-void syscall_exit(struct intr_frame *f);
-int syscall_exec(struct intr_frame *f);
-int syscall_wait(struct intr_frame *f);
-int syscall_creat(struct intr_frame *f);
-int syscall_remove(struct intr_frame *f);
-int syscall_open(struct intr_frame *f);
-int syscall_filesize(struct intr_frame *f);
-int syscall_read(struct intr_frame *f);
-int syscall_write(struct intr_frame *f);
-void syscall_seek(struct intr_frame *f);
-int syscall_tell(struct intr_frame *f);
-void syscall_close(struct intr_frame *f);
-void syscall_halt(void);
-
-
-
-void pop_stack(int *esp, int *a, int offset){
-	int *tmp_esp = esp;
-	*a = *((int *)is_valid_addr(tmp_esp + offset));
-}
-void syscall_halt(void){
-	shutdown_power_off();
-}
-void
-syscall_init (void)
+static struct open_file
 {
-  intr_register_int (0x30, 3, INTR_ON, syscall_handler, "syscall");
+    int fd;
+    struct file *file;
+    struct list_elem elem;
+};
+
+static void syscall_handler(struct intr_frame *);
+static bool is_valid_ptr(const void *ptr);
+static bool is_user_mem(const void *start, size_t size);
+static bool is_valid_str(const char *str);
+static struct open_file *get_file_by_fd(const int fd);
+
+static void halt(void) NO_RETURN;
+static void exit(int status) NO_RETURN;
+static pid_t exec(const char *file);
+static int wait(pid_t);
+static bool create(const char *file, unsigned initial_size);
+static bool remove(const char *file);
+static int open(const char *file);
+static int filesize(int fd);
+static int read(int fd, void *buffer, unsigned length);
+static int write(int fd, const void *buffer, unsigned length);
+static void seek(int fd, unsigned position);
+static unsigned tell(int fd);
+static void close(int fd);
+
+static struct lock file_lock;
+
+void syscall_init(void)
+{
+    intr_register_int(0x30, 3, INTR_ON, syscall_handler, "syscall");
+
+    lock_init(&file_lock);
 }
 
-static void
-syscall_handler (struct intr_frame *f UNUSED)
+static void syscall_handler(struct intr_frame *f)
 {
-  	int *p = f->esp;
-	is_valid_addr(p);
+    USER_ASSERT(is_user_mem(f->esp, sizeof(void *)));
 
-  	int system_call = *p;
-	switch (system_call)
-	{
-		case SYS_HALT: syscall_halt(); break;
-		case SYS_EXIT: syscall_exit(f); break;
-		case SYS_EXEC: f->eax = syscall_exec(f); break;
-		case SYS_WAIT: f->eax = syscall_wait(f); break;
-		case SYS_CREATE: f->eax = syscall_creat(f); break;
-		case SYS_REMOVE: f->eax = syscall_remove(f); break;
-		case SYS_OPEN: f->eax = syscall_open(f); break;
-		case SYS_FILESIZE: f->eax = syscall_filesize(f); break;
-		case SYS_READ: f->eax = syscall_read(f); break;
-		case SYS_WRITE: f->eax = syscall_write(f); break;
-		case SYS_SEEK: syscall_seek(f); break;
-		case SYS_TELL: f->eax = syscall_tell(f); break;
-		case SYS_CLOSE: syscall_close(f); break;
+    void *args[4];
+    for (size_t i = 0; i != 4; ++i)
+        args[i] = f->esp + i * sizeof(void *);
 
-		default:
-		printf("Default %d\n",*p);
-	}
+    int syscall_num = *(int *)args[0];
+
+    /* Check validation. */
+    switch (syscall_num)
+    {
+    case SYS_READ:
+    case SYS_WRITE:
+        USER_ASSERT(is_user_mem(args[3], sizeof(void *)));
+    case SYS_CREATE:
+    case SYS_SEEK:
+        USER_ASSERT(is_user_mem(args[2], sizeof(void *)));
+    case SYS_EXIT:
+    case SYS_EXEC:
+    case SYS_WAIT:
+    case SYS_REMOVE:
+    case SYS_OPEN:
+    case SYS_FILESIZE:
+    case SYS_TELL:
+    case SYS_CLOSE:
+        USER_ASSERT(is_user_mem(args[1], sizeof(void *)));
+    case SYS_HALT:
+        break;
+    default:
+        NOT_REACHED();
+    }
+
+    /* Forward. */
+    switch (syscall_num)
+    {
+    case SYS_HALT:
+        halt();
+        NOT_REACHED();
+    case SYS_EXIT:
+        exit(*(int *)args[1]);
+        NOT_REACHED();
+    case SYS_EXEC:
+        f->eax = exec(*(const char **)args[1]);
+        break;
+    case SYS_WAIT:
+        f->eax = wait(*(pid_t *)args[1]);
+        break;
+    case SYS_CREATE:
+        f->eax = create(*(const char **)args[1], *(unsigned *)args[2]);
+        break;
+    case SYS_REMOVE:
+        f->eax = remove(*(const char **)args[1]);
+        break;
+    case SYS_OPEN:
+        f->eax = open(*(const char **)args[1]);
+        break;
+    case SYS_FILESIZE:
+        f->eax = filesize(*(int *)args[1]);
+        break;
+    case SYS_READ:
+        f->eax = read(*(int *)args[1], *(void **)args[2], *(unsigned *)args[3]);
+        break;
+    case SYS_WRITE:
+        f->eax = write(*(int *)args[1], *(const void **)args[2], *(unsigned *)args[3]);
+        break;
+    case SYS_SEEK:
+        seek(*(int *)args[1], *(unsigned *)args[2]);
+        break;
+    case SYS_TELL:
+        f->eax = tell(*(int *)args[1]);
+        break;
+    case SYS_CLOSE:
+        close(*(int *)args[1]);
+        break;
+    default:
+        NOT_REACHED();
+    }
 }
 
-int
-exec_process(char *file_name)
+/* Returns true if PTR is not a null pointer,
+    a pointer to kernel virtual address space
+    or a pointer to unmapped virtual memory. */
+static bool is_valid_ptr(const void *ptr)
 {
-	int tid;
-	lock_acquire(&filesys_lock);
-	char * name_tmp = malloc (strlen(file_name)+1);
-	strlcpy(name_tmp, file_name, strlen(file_name) + 1);
-
-	char *tmp_ptr;
-	name_tmp = strtok_r(name_tmp, " ", &tmp_ptr);
-
-	struct file *f = filesys_open(name_tmp);  // check whether the file exists. critical to test case "exec-missing"
-
-	if (f == NULL)
-	{
-		lock_release(&filesys_lock);
-		tid = -1;
-	}
-	else
-	{
-		file_close(f);
-		lock_release(&filesys_lock);
-		tid = process_execute(file_name);
-	}
-	return tid;
+    return ptr != NULL && is_user_vaddr(ptr) && pagedir_get_page(thread_current()->pagedir, ptr) != NULL;
 }
 
-void
-exit_process(int status)
+/* Returns true if [START, START + SIZE) is all valid. */
+static bool is_user_mem(const void *start, size_t size)
 {
-	struct child_process *cp;
-	struct thread *cur_thread = thread_current();
+    for (const void *ptr = start; ptr < start + size; ptr += PGSIZE)
+    {
+        if (!is_valid_ptr(ptr))
+            return false;
+    }
 
-	enum intr_level old_level = intr_disable();
-	for (struct list_elem *e = list_begin(&cur_thread->parent->children_list); e != list_end(&cur_thread->parent->children_list); e = list_next(e))
-	{
-		cp = list_entry(e, struct child_process, child_elem);
-		if (cp->tid == cur_thread->tid)
-		{
-			cp->if_waited = true;
-			cp->exit_status = status;
-		}
-	}
-	cur_thread->exit_status = status;
-	intr_set_level(old_level);
+    if (size > 1 && !is_valid_ptr(start + size - 1))
+        return false;
 
-	thread_exit();
+    return true;
 }
 
-void *
-is_valid_addr(const void *vaddr)
+/* Returns true if STR is a valid string in user space. */
+static bool is_valid_str(const char *str)
 {
-	void *page_ptr = NULL;
-	if (!is_user_vaddr(vaddr) || !(page_ptr = pagedir_get_page(thread_current()->pagedir, vaddr)))
-	{
-		exit_process(-1);
-		return 0;
-	}
-	return page_ptr;
+    if (!is_valid_ptr(str))
+        return false;
+
+    for (const char *c = str; *c != '\0';)
+    {
+        ++c;
+        if (c - str + 2 == PGSIZE || !is_valid_ptr(c))
+            return false;
+    }
+
+    return true;
 }
 
-  /* Find fd and return process file struct in the list,
-  if not exist return NULL. */
-struct process_file *
-search_fd(struct list* files, int fd)
+static struct open_file *get_file_by_fd(const int fd)
 {
-	struct process_file *proc_f;
-	for (struct list_elem *e = list_begin(files); e != list_end(files); e = list_next(e))
-	{
-		proc_f = list_entry(e, struct process_file, elem);
-		if (proc_f->fd == fd)
-			return proc_f;
-	}
-	return NULL;
+    struct list *l = &thread_current()->process->files;
+
+    for (struct list_elem *e = list_begin(l); e != list_end(l); e = list_next(e))
+    {
+        struct open_file *f = list_entry(e, struct open_file, elem);
+        if (f->fd == fd)
+            return f;
+    }
+
+    USER_ASSERT(false);
 }
 
-  /* close and free specific process files
-  by the given fd in the file list. Firstly,
-  find fd in the list, then remove it. */
-void
-clean_single_file(struct list* files, int fd)
+/* Terminates the current user program, returning
+    STATUS to the kernel. If the process’s parent
+    waits for it, this is the status that will be
+    returned. Conventionally, a status of 0 indicates
+    success and nonzero values indicate errors. */
+static void exit(int status)
 {
-	struct process_file *proc_f = search_fd(files,fd);
-	if (proc_f != NULL){
-		file_close(proc_f->ptr);
-		list_remove(&proc_f->elem);
-    	free(proc_f);
-	}
+    struct process *self = thread_current()->process;
+
+    while (!list_empty(&self->files))
+    {
+        struct open_file *f = list_entry(list_back(&self->files),
+                                         struct open_file, elem);
+        close(f->fd);
+    }
+
+    self->exit_code = status;
+    thread_exit();
 }
 
-  /* close and free all process files in the file list */
-void
-clean_all_files(struct list* files)
+/* Writes SIZE bytes from buffer to the open file FD. Returns the
+    number of bytes actually written, which may be less than SIZE if
+    some bytes could not be written.
+
+    Writing past end-of-file would normally extend the file, but file
+    growth is not implemented by the basic file system. The expected
+    behavior is to write as many bytes as possible up to end-of-file
+    and return the actual number written, or 0 if no bytes could be
+    written at all.
+
+    Fd 1 writes to the console. The code to write to the console should
+    write all of buffer in one call to putbuf(), at least as long as SIZE
+    is not bigger than a few hundred bytes. (It is reasonable to break up
+    larger buffers.) Otherwise, lines of text output by different processes
+    may end up interleaved on the console, confusing both human readers and
+    the grading scripts. */
+static int write(int fd, const void *buffer, unsigned size)
 {
-	struct process_file *proc_f;
-	while(!list_empty(files))
-	{
-		proc_f = list_entry (list_pop_front(files), struct process_file, elem);
-		file_close(proc_f->ptr);
-		list_remove(&proc_f->elem);
-		free(proc_f);
-	}
+    USER_ASSERT(is_user_mem(buffer, size));
+    USER_ASSERT(fd != STDIN_FILENO);
+
+    if (fd == STDOUT_FILENO)
+    {
+        putbuf((const char *)buffer, size);
+        return size;
+    }
+
+    struct open_file *f = get_file_by_fd(fd);
+
+    lock_acquire(&file_lock);
+    int ret = file_write(f->file, buffer, size);
+    lock_release(&file_lock);
+
+    return ret;
 }
 
-void
-syscall_exit(struct intr_frame *f)
+/* Runs the executable whose name is given in CMD_LINE,
+    passing any given arguments, and returns the new
+    process’s program id (pid). Must return pid -1,
+    which otherwise should not be a valid pid, if
+    the program cannot load or run for any reason.
+    Thus, the parent process cannot return from the
+    exec until it knows whether the child process
+    successfully loaded its executable. Use appropriate
+    synchronization to ensure this. */
+static pid_t exec(const char *cmd_line)
 {
-	int status;
-	pop_stack(f->esp, &status, 1);
-	exit_process(status);
+    USER_ASSERT(is_valid_str(cmd_line));
+
+    lock_acquire(&file_lock);
+    pid_t pid = process_execute(cmd_line);
+    lock_release(&file_lock);
+
+    if (pid == TID_ERROR)
+        return -1;
+
+    struct process *child = get_child(pid);
+    sema_down(&child->sema_load);
+
+    if (child->status == PROCESS_FAILED)
+    {
+        sema_down(&child->sema_wait);
+        palloc_free_page(child);
+        return -1;
+    }
+    else
+    {
+        ASSERT(child->status == PROCESS_NORMAL);
+        return pid;
+    }
 }
 
-int
-syscall_exec(struct intr_frame *f)
-{
-	char *file_name = NULL;
-	pop_stack(f->esp, &file_name, 1);
-	if (!is_valid_addr(file_name))
-		return -1;
+/* Waits for a child process PID and retrieves the
+    child’s exit status.
 
-	return exec_process(file_name);
+    If PID is still alive, waits until it terminates.
+    Then, returns the status that PID passed to exit.
+    If PID did not call exit(), but was terminated by
+    the kernel (e.g. killed due to an exception), wait(PID)
+    must return -1. It is perfectly legal for a parent
+    process to wait for child processes that have already
+    terminated by the time the parent calls wait, but the
+    kernel must still allow the parent to retrieve its
+    child’s exit status, or learn that the child was
+    terminated by the kernel.
+
+    wait must fail and return -1 immediately if any of the
+    following conditions is true:
+
+    a. PID does not refer to a direct child of the calling
+    process. PID is a direct child of the calling process if
+    and only if the calling process received PID as a return
+    value from a successful call to exec. Note that children
+    are not inherited: if A spawns child B and B spawns child
+    process C, then A cannot wait for C, even if B is dead.
+    A call to wait(C) by process A must fail. Similarly, orphaned
+    processes are not assigned to a new parent if their parent
+    process exits before they do.
+
+    b. The process that calls wait has already called wait on PID.
+    That is, a process may wait for any given child at most once.
+
+    Processes may spawn any number of children, wait for them in
+    any order, and may even exit without having waited for some or
+    all of their children. The design should consider all the ways
+    in which waits can occur. All of a process’s resources, including
+    its struct thread, must be freed whether its parent ever waits
+    for it or not, and regardless of whether the child exits before
+    or after its parent.
+
+    Must ensure that Pintos does not terminate until the initial
+    process exits. The supplied Pintos code tries to do this by
+    calling process_wait() (in‘userprog/process.c’) from main()
+    (in ‘threads/init.c’). Implement process_wait() according to the
+    comment at the top of the function and then implement the wait
+    system call in terms of process_wait(). */
+static int wait(pid_t pid)
+{
+    return process_wait(pid);
 }
 
-int
-syscall_wait(struct intr_frame *f)
+/* Terminates Pintos by calling shutdown_power_off()
+    (declaredin‘devices/shutdown.h’). This should be
+    seldom used, because you losesome information
+    about possible deadlock situations, etc. */
+static void halt(void)
 {
-	tid_t child_tid;
-	pop_stack(f->esp, &child_tid, 1);
-	return process_wait(child_tid);
+    shutdown_power_off();
 }
 
-int
-syscall_creat(struct intr_frame *f)
+/* Creates a new file called FILE initially INITIAL_SIZE bytes in size.
+    Returns true if successful, false otherwise. Creating a new file
+    does not open it: opening the new file is a separate operation which
+    would require a open system call. */
+static bool create(const char *file, unsigned initial_size)
 {
-	int ret;
-	off_t initial_size;
-	char *name;
+    USER_ASSERT(is_valid_str(file));
 
-	pop_stack(f->esp, &initial_size, 5);
-	pop_stack(f->esp, &name, 4);
-	if (!is_valid_addr(name))
-		ret = -1;
+    lock_acquire(&file_lock);
+    bool ret = filesys_create(file, initial_size);
+    lock_release(&file_lock);
 
-	lock_acquire(&filesys_lock);
-	ret = filesys_create(name, initial_size);
-	lock_release(&filesys_lock);
-	return ret;
+    return ret;
 }
 
-int
-syscall_remove(struct intr_frame *f)
+/* Deletes the file called FILE. Returns true if successful, false
+    otherwise. A file may be removed regardless of whether it is open
+    or closed, and removing an open file does not close it. */
+static bool remove(const char *file)
 {
-	int ret;
-	char *name;
+    USER_ASSERT(is_valid_str(file));
 
-	pop_stack(f->esp, &name, 1);
-	if (!is_valid_addr(name))
-		ret = -1;
+    lock_acquire(&file_lock);
+    bool ret = filesys_remove(file);
+    lock_release(&file_lock);
 
-	lock_acquire(&filesys_lock);
-	if (filesys_remove(name) == NULL)
-		ret = false;
-	else
-		ret = true;
-	lock_release(&filesys_lock);
-
-	return ret;
+    return ret;
 }
 
-int
-syscall_open(struct intr_frame *f)
+/* Opens the file called FILE. Returns a nonnegative integer handle
+    called a “file descriptor” (fd), or -1 if the file could not be
+    opened.
+
+    File descriptors numbered 0 and 1 are reserved for the console:
+    fd 0 (STDIN_FILENO) is standard input, fd 1 (STDOUT_FILENO) is
+    standard output. The open system call will never return either of
+    these file descriptors, which are valid as system call arguments
+    only.
+
+    Each process has an independent set of file descriptors. File
+    descriptors are not inherited by child processes.
+
+    When a single file is opened more than once, whether by a single
+    process or different processes, each open returns a new file
+    descriptor. Different file descriptors for a single file are closed
+    independently in separate calls to close and they do not share a
+    file position. */
+static int open(const char *file)
 {
-	int ret;
-	char *name;
+    USER_ASSERT(is_valid_str(file));
 
-	pop_stack(f->esp, &name, 1);
-	if (!is_valid_addr(name))
-		ret = -1;
+    lock_acquire(&file_lock);
+    struct file *f = filesys_open(file);
+    lock_release(&file_lock);
 
-	lock_acquire(&filesys_lock);
-	struct file *fptr = filesys_open(name);
-	lock_release(&filesys_lock);
+    if (f == NULL)
+        return -1;
 
-	if (fptr == NULL)
-		ret = -1;
-	else
-	{
-		struct process_file *pfile = malloc(sizeof(*pfile));
-		pfile->ptr = fptr;
-		pfile->fd = thread_current()->fd_count;
-		thread_current()->fd_count++;
-		list_push_back(&thread_current()->opened_files, &pfile->elem);
-		ret = pfile->fd;
-	}
-	return ret;
+    struct process *self = thread_current()->process;
+
+    struct open_file *open_file = malloc(sizeof(struct open_file));
+    open_file->fd = self->fd++;
+    open_file->file = f;
+    list_push_back(&self->files, &open_file->elem);
+
+    return open_file->fd;
 }
 
-int
-syscall_filesize(struct intr_frame *f)
+/* Returns the size, in bytes, of the file open as FD. */
+static int filesize(int fd)
 {
-	int ret;
-	int fd;
-	pop_stack(f->esp, &fd, 1);
+    struct open_file *f = get_file_by_fd(fd);
 
-	lock_acquire(&filesys_lock);
-	ret = file_length (search_fd(&thread_current()->opened_files, fd)->ptr);
-	lock_release(&filesys_lock);
+    lock_acquire(&file_lock);
+    int ret = file_length(f->file);
+    lock_release(&file_lock);
 
-	return ret;
+    return ret;
 }
 
-int
-syscall_read(struct intr_frame *f)
+/* Reads SIZE bytes from the file open as FD into buffer. Returns
+    the number of bytes actually read (0 at end of file), or -1 if
+    the file could not be read (due to a condition other than end
+    of file).
+
+    Fd 0 reads from the keyboard using input_getc(). */
+static int read(int fd, void *buffer, unsigned size)
 {
-	int ret;
-	int size;
-	void *buffer;
-	int fd;
+    USER_ASSERT(is_user_mem(buffer, size));
+    USER_ASSERT(fd != STDOUT_FILENO);
 
-	pop_stack(f->esp, &size, 7);
-	pop_stack(f->esp, &buffer, 6);
-	pop_stack(f->esp, &fd, 5);
+    if (fd == STDIN_FILENO)
+    {
+        uint8_t *c = buffer;
+        for (unsigned i = 0; i != size; ++i)
+            *c++ = input_getc();
+        return size;
+    }
 
-	if (!is_valid_addr(buffer))
-		ret = -1;
+    struct open_file *f = get_file_by_fd(fd);
 
-	if (fd == 0)
-	{
-		int i;
-		uint8_t *buffer = buffer;
-		for (i = 0; i < size; i++)
-			buffer[i] = input_getc();
-		ret = size;
-	}
-	else
-	{
-		struct process_file *pf = search_fd(&thread_current()->opened_files, fd);
-		if (pf == NULL)
-			ret = -1;
-		else
-		{
-			lock_acquire(&filesys_lock);
-			ret = file_read(pf->ptr, buffer, size);
-			lock_release(&filesys_lock);
-		}
-	}
+    lock_acquire(&file_lock);
+    int ret = file_read(f->file, buffer, size);
+    lock_release(&file_lock);
 
-	return ret;
+    return ret;
 }
 
-int
-syscall_write(struct intr_frame *f)
+/* Changes the next byte to be read or written in open file FD to POSITION,
+    expressed in bytes from the beginning of the file. (Thus, a position of
+    0 is the file’s start.)
+
+    A seek past the current end of a file is not an error. A later read
+    obtains 0 bytes,indicating end of file. A later write extends the file,
+    filling any unwritten gap with zeros. (However, in  Pintos files have a
+    fixed length until project 4 is complete, so writes past end of file
+    will return an error.) These semantics are implemented in the file
+    system and do not require any special effort in system call implementation. */
+static void seek(int fd, unsigned position)
 {
-	int ret;
-	int size;
-	void *buffer;
-	int fd;
+    struct open_file *f = get_file_by_fd(fd);
 
-	pop_stack(f->esp, &size, 7);
-	pop_stack(f->esp, &buffer, 6);
-	pop_stack(f->esp, &fd, 5);
-
-	if (!is_valid_addr(buffer))
-		ret = -1;
-
-	if (fd == 1)
-	{
-		putbuf(buffer, size);
-		ret = size;
-	}
-	else
-	{
-		enum intr_level old_level = intr_disable();
-		struct process_file *pf = search_fd(&thread_current()->opened_files, fd);
-		intr_set_level (old_level);
-
-		if (pf == NULL)
-			ret = -1;
-		else
-		{
-			lock_acquire(&filesys_lock);
-			ret = file_write(pf->ptr, buffer, size);
-			lock_release(&filesys_lock);
-		}
-	}
-
-	return ret;
+    lock_acquire(&file_lock);
+    file_seek(f->file, position);
+    lock_release(&file_lock);
 }
 
-void
-syscall_seek(struct intr_frame *f)
+/* Returns the position of the next byte to be read or written in open
+    file FD, expressed in bytes from the beginning of the file. */
+static unsigned tell(int fd)
 {
-	int fd;
-	int pos;
-	pop_stack(f->esp, &fd, 5);
-	pop_stack(f->esp, &pos, 4);
+    struct open_file *f = get_file_by_fd(fd);
 
-	lock_acquire(&filesys_lock);
-	file_seek(search_fd(&thread_current()->opened_files, pos)->ptr, fd);
-	lock_release(&filesys_lock);
+    lock_acquire(&file_lock);
+    int ret = file_tell(f->file);
+    lock_release(&file_lock);
+
+    return ret;
 }
 
-int
-syscall_tell(struct intr_frame *f)
+/* Closes file descriptor FD. Exiting or terminating a process implicitly
+    closes all its open file descriptors, as if by calling this function
+    for each one. */
+static void close(int fd)
 {
-	int ret;
-	int fd;
-	pop_stack(f->esp, &fd, 1);
+    struct open_file *f = get_file_by_fd(fd);
 
-	lock_acquire(&filesys_lock);
-	ret = file_tell(search_fd(&thread_current()->opened_files, fd)->ptr);
-	lock_release(&filesys_lock);
+    lock_acquire(&file_lock);
+    file_close(f->file);
+    lock_release(&file_lock);
 
-	return ret;
-}
-
-void
-syscall_close(struct intr_frame *f)
-{
-	int fd;
-	pop_stack(f->esp, &fd, 1);
-
-	lock_acquire(&filesys_lock);
-	clean_single_file(&thread_current()->opened_files, fd);
-	lock_release(&filesys_lock);
+    list_remove(&f->elem);
+    free(f);
 }

@@ -7,8 +7,8 @@
 /* A counting semaphore. */
 struct semaphore
 {
-    unsigned value;             /* Current value. */
-    struct list waiters;        /* List of waiting threads. */
+    unsigned value;      /* Current value. */
+    struct list waiters; /* List of waiting threads. */
 };
 
 void sema_init(struct semaphore *, unsigned value);
@@ -20,10 +20,12 @@ void sema_self_test(void);
 /* Lock. */
 struct lock
 {
-    struct thread *holder;      /* Thread holding lock (for debugging). */
+    struct thread *holder;      /* Thread holding lock (for donation). */
     struct semaphore semaphore; /* Binary semaphore controlling access. */
-    struct list_elem elem;      /* List element for priority donation. */
-    int max_priority;          /* Max priority among the threads acquiring the lock. */
+
+    /* Shared between thread.c and synch.c. */
+    struct list_elem elem; /* List element. */
+    int priority;          /* Priority donated to HOLDER. */
 };
 
 void lock_init(struct lock *);
@@ -31,24 +33,28 @@ void lock_acquire(struct lock *);
 bool lock_try_acquire(struct lock *);
 void lock_release(struct lock *);
 bool lock_held_by_current_thread(const struct lock *);
-bool lock_cmp_priority(const struct list_elem *a, const struct list_elem *b, void *aux);
+list_less_func lock_elem_priority_cmp;
+void lock_update_priority(struct lock *);
 
 /* Condition variable. */
 struct condition
 {
-    struct list waiters;        /* List of waiting threads. */
+    struct semaphore semaphore; /* Condition is a variant of semaphore. */
 };
 
 void cond_init(struct condition *);
 void cond_wait(struct condition *, struct lock *);
 void cond_signal(struct condition *, struct lock *);
 void cond_broadcast(struct condition *, struct lock *);
-bool cond_sema_cmp_priority(const struct list_elem *a, const struct list_elem *b, void *aux);
 
 /* Optimization barrier.
+
    The compiler will not reorder operations across an
    optimization barrier.  See "Optimization Barriers" in the
    reference guide for more information.*/
-#define barrier() asm volatile ("" : : : "memory")
+#define barrier() asm volatile("" \
+                               :  \
+                               :  \
+                               : "memory")
 
 #endif /* threads/synch.h */

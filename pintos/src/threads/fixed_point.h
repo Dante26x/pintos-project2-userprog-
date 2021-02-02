@@ -1,32 +1,57 @@
-#ifndef __THREAD_FIXED_POINT_H
-#define __THREAD_FIXED_POINT_H
+#ifndef THREADS_FIXED_POINT_H
+#define THREADS_FIXED_POINT_H
 
-/* Basic definitions of fixed point. */
-typedef int fixed_t;
-/* 16 LSB used for fractional part. */
-#define FP_SHIFT_AMOUNT 16
-/* Convert a value to fixed-point value. */
-#define FP_CONST(A) ((fixed_t)(A << FP_SHIFT_AMOUNT))
-/* Add two fixed-point value. */
-#define FP_ADD(A,B) (A + B)
-/* Add a fixed-point value A and an int value B. */
-#define FP_ADD_MIX(A,B) (A + (B << FP_SHIFT_AMOUNT))
-/* Substract two fixed-point value. */
-#define FP_SUB(A,B) (A - B)
-/* Substract an int value B from a fixed-point value A */
-#define FP_SUB_MIX(A,B) (A - (B << FP_SHIFT_AMOUNT))
-/* Multiply a fixed-point value A by an int value B. */
-#define FP_MULT_MIX(A,B) (A * B)
-/* Divide a fixed-point value A by an int value B. */
-#define FP_DIV_MIX(A,B) (A / B)
-/* Multiply two fixed-point value. */
-#define FP_MULT(A,B) ((fixed_t)(((int64_t) A) * B >> FP_SHIFT_AMOUNT))
-/* Divide two fixed-point value. */
-#define FP_DIV(A,B) ((fixed_t)((((int64_t) A) << FP_SHIFT_AMOUNT) / B))
-/* Get integer part of a fixed-point value. */
-#define FP_INT_PART(A) (A >> FP_SHIFT_AMOUNT)
-/* Get rounded integer of a fixed-point value. */
-#define FP_ROUND(A) (A >= 0 ? ((A + (1 << (FP_SHIFT_AMOUNT - 1))) >> FP_SHIFT_AMOUNT) \
-        : ((A - (1 << (FP_SHIFT_AMOUNT - 1))) >> FP_SHIFT_AMOUNT))
+/* Fixed-point real arithmetic used by the mlfqs (multilevel feedback queue scheduler). */
 
-#endif /* thread/fixed_point.h */
+#include <stdint.h>
+
+/* Fixed-point number. */
+typedef int32_t fp_t;
+#define fp_size 32
+
+/* Suppose that we are using a p.q fixed-point format. */
+#define fp_p 17
+#define fp_q 14
+
+#if fp_p + fp_q + 1 != fp_size
+#error fp_p + fp_q + 1 != fp_size
+#endif
+
+#define fp_f (1 << fp_q)
+
+/* x and y are fixed-point numbers, n is an integer. */
+
+/* Convert n to fixed point. */
+#define i_to_fp(n) ((n)*fp_f)
+
+/* Convert x to integer (rounding toward zero). */
+#define fp_to_i_0(x) ((x) / fp_f)
+
+/* Convert x to integer (rounding to nearest). */
+#define fp_to_i(x) (((x) > 0) ? (fp_to_i_0((x) + fp_f / 2)) : (fp_to_i_0((x)-fp_f / 2)))
+
+/* Add x and y. */
+#define fp_add_fp(x, y) ((x) + (y))
+
+/* Subtract y from x. */
+#define fp_sub_fp(x, y) ((x) - (y))
+
+/* Add x and n. */
+#define fp_add_i(x, n) (fp_add_fp((x), i_to_fp(n)))
+
+/* Subtract n from x. */
+#define fp_sub_i(x, n) (fp_sub_fp((x), i_to_fp(n)))
+
+/* Multiply x by y. */
+#define fp_mul_fp(x, y) ((fp_t)(((intmax_t)(x)) * (y) / fp_f))
+
+/* Multiply x by n. */
+#define fp_mul_i(x, n) ((x) * (n))
+
+/* Divide x by y. */
+#define fp_div_fp(x, y) ((fp_t)(((intmax_t)(x)) * fp_f / (y)))
+
+/* Divide x by n. */
+#define fp_div_i(x, n) ((x) / (n))
+
+#endif /* threads/fixed_point.h */
